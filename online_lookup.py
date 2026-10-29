@@ -121,6 +121,19 @@ def _local_steam_client_build(overlay_path: str | None) -> tuple[str | None, str
     return ver, steam_client_build_date(ver)
 
 
+def _client_vs_tracking(
+    local_ver: str | None, snap_ver: str | None
+) -> str | None:
+    if not local_ver or not snap_ver:
+        return None
+    lv, sv = int(local_ver), int(snap_ver)
+    if lv < sv:
+        return "older"
+    if lv > sv:
+        return "newer"
+    return "same"
+
+
 def steamtracking_crc(
     data: bytes,
     *,
@@ -164,22 +177,30 @@ def steamtracking_crc(
                 break
 
     if tracked_path and tracked_crc and tracked_crc != crc:
-        detail = (
-            f"newer than {snap_label}: {tracked_path} was CRC {tracked_crc}, "
-            f"local CRC {crc}"
-        )
+        rel_cmp = _client_vs_tracking(local_ver, snap_ver)
+        if rel_cmp == "older":
+            lead = f"Installed client older than {snap_label}"
+        elif rel_cmp == "newer":
+            lead = f"Installed client newer than {snap_label}"
+        elif rel_cmp == "same":
+            lead = f"CRC mismatch vs {snap_label} (same build number)"
+        else:
+            lead = f"CRC differs from {snap_label}"
+        detail = f"{lead}: {tracked_path} — tracked CRC {tracked_crc}, local {crc}"
         if local_label:
             detail += f"; {local_label}"
         return OnlineHit("SteamTracking ClientContentLinux", STEAMTRACKING_MANIFEST, detail=detail)
 
-    detail = f"CRC {crc} not in {snap_label}"
+    detail = f"CRC {crc} not listed in {snap_label}"
+    rel_cmp = _client_vs_tracking(local_ver, snap_ver)
     if local_label:
-        detail += f"; {local_label} (minimum: newer than tracked snapshot"
-        if snap_ver:
-            detail += f" {snap_ver} ~{snap_date}"
-        detail += ")"
-    else:
-        detail += " (local file newer than SteamDB tracking baseline)"
+        detail += f"; {local_label}"
+        if rel_cmp == "older":
+            detail += " (older than SteamTracking snapshot)"
+        elif rel_cmp == "newer":
+            detail += " (newer than SteamTracking snapshot)"
+    elif rel_cmp is None:
+        detail += " (overlay not listed at this CRC in SteamTracking manifest)"
     return OnlineHit("SteamTracking ClientContentLinux", STEAMTRACKING_MANIFEST, detail=detail)
 
 

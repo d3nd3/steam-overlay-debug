@@ -18,8 +18,24 @@ WRITE_CURSOR_OFF = 4  # uint32 at byte offset 4 (research watch/xxd recipe)
 INPUTEVENT_MAP_SIZES = frozenset({MAP_SIZE_LEGACY, MAP_SIZE_RT64})
 DELETED_SUFFIX = " (deleted)"
 VULKAN_LAYER_MAP = re.compile(r"steamoverlayvulkanlayer.*\.so", re.I)
+OVERLAY_RENDERER_MAP = re.compile(r"gameoverlayrenderer.*\.so", re.I)
 HEADER_KIND_OFF = 16  # uint32 == 2 on real InputEvent streams (Wine + native)
 INPUTEVENT_HEADER_KIND = 2
+LAUNCHER_COMMS = frozenset({"sh", "bash", "dash", "reaper", "steam-launch-wrapper"})
+WINE_OVERLAY_HELPER = frozenset(
+    {
+        "steam.exe",
+        "wineserver",
+        "services.exe",
+        "winedevice.exe",
+        "svchost.exe",
+        "plugplay.exe",
+        "lsass.exe",
+        "rpcss.exe",
+        "tabtip.exe",
+        "python3",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -32,11 +48,9 @@ class InputEventShmInfo:
     bytes_used_estimate: int
     pct_of_payload: float
     sample_seconds: float
-    offset_before: int
-    offset_after: int
-    delta_bytes: float
-    rate_bytes_per_sec: float
-    tick_hint: str
+    cursor_before: int
+    cursor_after: int
+    cursor_delta: float
 
 
 def path_for_pid(pid: int) -> Path:
@@ -167,7 +181,6 @@ def discover_shm_path(pid: int) -> tuple[Path, int, str] | None:
             continue
         if "w" not in perms:
             continue
-        # Prefer legacy 524304 (524288 payload + header) over bare 524288 maps.
         rank = 2 if size == MAP_SIZE_LEGACY else 3
         scored.append((rank, size, name, perms))
 
@@ -200,15 +213,31 @@ def has_inputevent_shm(pid: int) -> bool:
     return discover_shm_path(pid) is not None
 
 
-def has_overlay_inputevent_client(pid: int) -> bool:
-    """InputEvent SHM on the process that actually hosts the overlay client (not Wine 524304 noise)."""
-    found = discover_shm_path(pid)
-    if not found:
+def _renderer_mapped(pid: int) -> bool:
+    maps = Path(f"/proc/{pid}/maps")
+    if not maps.is_file():
         return False
-    _, _, label = found
-    if path_for_pid(pid).is_file() or "GameOverlay_InputEventStream" in label:
-        return True
-    return _vulkan_layer_mapped(pid)
+    for line in maps.read_text().splitlines():
+        parts = line.split()
+        if len(parts) < 6:
+            continue
+        pathname = " ".join(parts[5:])
+        if pathname.endswith(DELETED_SUFFIX):
+            pathname = pathname[: -len(DELETED_SUFFIX)]
+        if OVERLAY_RENDERER_MAP.search(pathname):
+            return True
+    return False
+
+
+def has_overlay_inputevent_client(pid: int) -> bool:
+    """Validated InputEvent ring + overlay .so on a non-helper, non-launcher process."""
+    if not discover_shm_path(pid) or not _renderer_mapped(pid):
+        return False
+    try:
+        comm = Path(f"/proc/{pid}/comm").read_text().strip()
+    except OSError:
+        return False
+    return comm not in LAUNCHER_COMMS and comm not in WINE_OVERLAY_HELPER
 
 
 def mapped_sizes_for_pid(pid: int) -> list[tuple[int, str]]:
@@ -231,32 +260,19 @@ def mapped_sizes_for_pid(pid: int) -> list[tuple[int, str]]:
     return out
 
 
-def _tick_hint(rate: float, offset: int, capacity: int) -> str:
-    if rate >= 4.0:
-        return "frame tick likely (idle heartbeat ~8 B/s)"
-    if rate >= 0.5:
-        return "slow creep — tick or light input"
-    if offset >= capacity - 256:
-        return "near full — #11446 stall risk if tick absent"
-    if rate < 0.25 and offset > 0:
-        return "idle offset flat — frame tick probably not running"
-    return "idle/low activity — check again while not touching input"
-
-
-def probe_pid(pid: int, *, sample_seconds: float = 1.0) -> InputEventShmInfo | None:
+def probe_pid(pid: int, *, sample_seconds: float = 2.0) -> InputEventShmInfo | None:
     found = discover_shm_path(pid)
     if not found:
         return None
     path, map_size, label = found
     capacity = _capacity_for_map_size(map_size)
+    dt = max(0.1, sample_seconds)
     o0 = _read_write_offset(path)
-    time.sleep(max(0.1, sample_seconds))
+    time.sleep(dt)
     o1 = _read_write_offset(path)
-    dt = sample_seconds
     delta = o1 - o0
     if delta < 0:
-        delta = o1  # wrapped / reset toward 0
-    rate = delta / dt
+        delta = float(o1)
     used = min(o1, capacity)
     pct = (100.0 * used / capacity) if capacity else 0.0
     return InputEventShmInfo(
@@ -268,25 +284,33 @@ def probe_pid(pid: int, *, sample_seconds: float = 1.0) -> InputEventShmInfo | N
         bytes_used_estimate=used,
         pct_of_payload=pct,
         sample_seconds=dt,
-        offset_before=o0,
-        offset_after=o1,
-        delta_bytes=float(delta),
-        rate_bytes_per_sec=rate,
-        tick_hint=_tick_hint(rate, o1, capacity),
+        cursor_before=o0,
+        cursor_after=o1,
+        cursor_delta=float(delta),
     )
 
 
+def _frame_loop_line(info: InputEventShmInfo) -> str:
+    t = info.sample_seconds
+    if info.cursor_delta > 0:
+        return (
+            f"Overlay frame loop active: Yes ({t:g}s sample, cursor +{info.cursor_delta:.0f})."
+        )
+    return f"Overlay frame loop active: No ({t:g}s sample, no inputs digested)."
+
+
 def format_report(info: InputEventShmInfo, *, brief: bool, indent: str) -> list[str]:
+    loop = _frame_loop_line(info)
     lines = [
         f"{indent}InputEvent SHM: {info.label}",
         f"{indent}  map {info.map_size} B (524304 = 524288 payload + 16 header; 524288 = 0x80000 class)",
-        f"{indent}  write cursor @+{WRITE_CURSOR_OFF}: {info.offset_before} → {info.offset_after} "
-        f"({info.delta_bytes:+.0f} B in {info.sample_seconds:.1f}s, {info.rate_bytes_per_sec:.1f} B/s)",
-        f"{indent}  fill ~{info.bytes_used_estimate}/{info.payload_capacity} B ({info.pct_of_payload:.1f}% of ring)",
-        f"{indent}  → {info.tick_hint}",
+        f"{indent}  write cursor @ byte {WRITE_CURSOR_OFF}: {info.cursor_before} → {info.cursor_after}",
+        f"{indent}  ring usage: {info.bytes_used_estimate}/{info.payload_capacity} bytes "
+        f"({info.pct_of_payload:.1f}% full)",
+        f"{indent}  {loop}",
     ]
     if brief:
-        return [lines[0], lines[2], lines[4]]
+        return [lines[0], lines[4]]
     return lines
 
 

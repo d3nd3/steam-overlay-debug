@@ -12,6 +12,14 @@ from pathlib import Path
 
 from version import OverlayVersion, analyze_bytes
 
+from inputevent_shm import (
+    discover_shm_path,
+    has_overlay_inputevent_client,
+    path_for_pid,
+    print_for_pid as print_inputevent_shm,
+)
+from vulkan_layer_manifest import format_manifest_lines, steam_overlay_manifests
+
 OVERLAY_MAP = re.compile(r"gameoverlayrenderer.*\.so", re.I)
 VULKAN_LAYER_MAP = re.compile(r"steamoverlayvulkanlayer.*\.so", re.I)
 DELETED_SUFFIX = " (deleted)"
@@ -94,6 +102,100 @@ def _vulkan_layer_map_paths(pid: int) -> list[str]:
     return sorted(out)
 
 
+VULKAN_LOADER_MAP = re.compile(r"libvulkan\.so", re.I)
+EGL_MAP = re.compile(r"libEGL\.so", re.I)
+OPENGL_MAP = re.compile(r"lib(?:GL|OpenGL)\.so", re.I)
+WINE_D3D_MAP = re.compile(r"(?:wined3d|d3d11|dxgi)", re.I)
+WEBKIT_MAP = re.compile(r"libwebkit2?gtk|JavaScriptCore|libWTF-", re.I)
+CEF_MAP = re.compile(r"libcef\.so|libcef_dll|/cef/libcef", re.I)
+ANGLE_MAP = re.compile(r"libEGL.*angle|libGLES.*angle|libangle\.so", re.I)
+SDL_MAP = re.compile(r"libSDL2?-\d*\.so", re.I)
+
+
+def _graphics_apis_in_maps(maps: str) -> list[str]:
+    apis: list[str] = []
+    if VULKAN_LOADER_MAP.search(maps) or VULKAN_LAYER_MAP.search(maps):
+        apis.append("Vulkan")
+    if EGL_MAP.search(maps):
+        apis.append("EGL")
+    if OPENGL_MAP.search(maps):
+        apis.append("OpenGL")
+    if WINE_D3D_MAP.search(maps):
+        apis.append("Direct3D (Wine)")
+    if WEBKIT_MAP.search(maps):
+        apis.append("WebKit")
+    if CEF_MAP.search(maps):
+        apis.append("CEF/Chromium")
+    if ANGLE_MAP.search(maps):
+        apis.append("ANGLE")
+    if SDL_MAP.search(maps):
+        apis.append("SDL2")
+    if ("WebKit" in apis or "CEF/Chromium" in apis) and ("OpenGL" in apis or "EGL" in apis):
+        apis.append("WebGL (browser engine + GL/EGL)")
+    return apis
+
+
+def _overlay_graphics_report(pid: int) -> tuple[str, str, list[str]]:
+    """Overlay injection path + graphics libraries visible in /proc/pid/maps."""
+    try:
+        maps = Path(f"/proc/{pid}/maps").read_text()
+        envs = _proc_environ(pid)
+    except OSError:
+        return "unknown", "could not read process maps or environment", []
+    apis = _graphics_apis_in_maps(maps)
+    vk_paths = _vulkan_layer_map_paths(pid)
+    vk_enabled = any(
+        line.startswith("ENABLE_VK_LAYER_VALVE_steam_overlay_1=")
+        and line.split("=", 1)[1].strip() not in ("0", "")
+        for line in envs
+    )
+    has_renderer = bool(overlay_mappings(pid))
+    manifests = steam_overlay_manifests(pid, envs)
+    active_manifest = next(
+        (m for m in manifests if m.library_mapped or (m.loader_enabled and not m.loader_disabled)),
+        None,
+    )
+
+    if vk_paths and (vk_enabled or (active_manifest and active_manifest.library_mapped)):
+        detail = "steamoverlayvulkanlayer.so mapped"
+        if active_manifest:
+            detail += f"; manifest {active_manifest.json_path.name}"
+            if active_manifest.loader_enabled:
+                detail += ", enable_environment met"
+            elif active_manifest.library_mapped:
+                detail += ", loaded without enable_environment"
+        elif vk_enabled:
+            detail += "; ENABLE_VK_LAYER_VALVE_steam_overlay set"
+        if has_renderer:
+            detail += "; gameoverlayrenderer.so preloaded"
+        return "Vulkan (Steam overlay layer)", detail, apis
+    if vk_paths:
+        return (
+            "Vulkan (layer mapped, overlay env off)",
+            "steamoverlayvulkanlayer.so in maps; ENABLE_VK_LAYER_VALVE_steam_overlay not set",
+            apis,
+        )
+    if has_renderer and ("OpenGL" in apis or "EGL" in apis):
+        return (
+            "OpenGL (gameoverlayrenderer preload)",
+            "no steamoverlayvulkanlayer.so; hook via preloaded gameoverlayrenderer.so",
+            apis,
+        )
+    if has_renderer and "Direct3D (Wine)" in apis:
+        return (
+            "Direct3D via Wine (gameoverlayrenderer preload)",
+            "no Vulkan overlay layer in maps; gameoverlayrenderer.so preloaded",
+            apis,
+        )
+    if has_renderer:
+        return (
+            "gameoverlayrenderer.so only",
+            "overlay .so mapped; injection API not identified",
+            apis,
+        )
+    return "unknown", "no overlay libraries in maps", apis
+
+
 def _print_layer_vulkan_status(pid: int, *, indent: str, brief: bool) -> None:
     try:
         envs = _layer_env_lines(pid)
@@ -121,12 +223,15 @@ def _print_layer_vulkan_status(pid: int, *, indent: str, brief: bool) -> None:
                 print(f"{indent}  {line}")
     else:
         print(f"{indent}layer env: (no ENABLE/DISABLE_VK_LAYER, SteamNoOverlayUI, or VK_IMPLICIT_LAYER_PATH)")
-
-
-from inputevent_shm import (
-    has_overlay_inputevent_client,
-    print_for_pid as print_inputevent_shm,
-)
+    if not brief:
+        try:
+            full_env = _proc_environ(pid)
+        except OSError:
+            full_env = []
+        for line in format_manifest_lines(
+            steam_overlay_manifests(pid, full_env), indent=indent, pid=pid
+        ):
+            print(line)
 
 
 def _proc_comm(pid: int) -> str:
@@ -473,9 +578,9 @@ def pids_with_overlay_loaded(*, include_launchers: bool) -> list[int]:
     return hits
 
 
-def pids_for_scan() -> list[int]:
-    """Processes listed by --scan: map gameoverlayrenderer.so and host InputEvent SHM."""
-    hits: list[int] = []
+def pids_for_scan() -> tuple[list[int], bool]:
+    """Prefer InputEvent SHM clients; else fall back to any gameoverlayrenderer.so mapping."""
+    shm: list[int] = []
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit():
             continue
@@ -486,8 +591,13 @@ def pids_for_scan() -> list[int]:
         except (OSError, PermissionError, FileNotFoundError):
             continue
         if has_overlay_inputevent_client(pid):
-            hits.append(pid)
-    return sorted(set(hits))
+            shm.append(pid)
+    if shm:
+        return sorted(set(shm)), True
+    overlay = pids_with_overlay_loaded(include_launchers=False)
+    if overlay:
+        return overlay, False
+    return pids_with_overlay_loaded(include_launchers=True), False
 
 
 def analyze_loaded(entry: LoadedOverlay) -> OverlayVersion:
@@ -583,23 +693,28 @@ def _game_renderer_rows(rows: list[ScanRow]) -> list[ScanRow]:
     return sorted(picked.values(), key=lambda x: x.pid)
 
 
-def _print_game_renderer_guess(
-    clients: list[ScanRow], rows: list[ScanRow], *, brief: bool
-) -> None:
-    print("=== Game renderer (guess) ===")
-    if not clients:
-        print("  No InputEvent SHM client with overlay mapped — cannot infer active build.\n")
+def _print_renderer_detection(r: ScanRow, *, indent: str, brief: bool) -> None:
+    phrase = _overlay_build_phrase(r.info.deploy_path, r.info.gnu_build_id or r.info.sha256)
+    injection, inj_detail, apis = _overlay_graphics_report(r.pid)
+    api_line = ", ".join(apis) if apis else "none matched in /proc/maps"
+    if brief:
+        print(f"{indent}Renderer: {phrase} · injection {injection} · APIs {api_line}")
         return
-    for r in clients:
-        phrase = _overlay_build_phrase(r.info.deploy_path, r.info.gnu_build_id or r.info.sha256)
-        if brief:
-            print(f"  {r.comm} pid {r.pid}: {phrase}")
-        else:
-            print(f"  {r.comm} (pid {r.pid}): {phrase}")
-            print(f"    {r.ent.pathname}")
-    if len({r.info.sha256 for r in rows}) > len({r.info.sha256 for r in clients}):
-        print("  (Other builds in this scan are launch-shell preloads or unrelated mappings.)")
-    print()
+    print(f"{indent}Renderer build: {phrase}")
+    print(f"{indent}  Overlay injection: {injection} — {inj_detail}")
+    print(f"{indent}  Graphics APIs in process: {api_line}")
+    print(f"{indent}  Why this process is the overlay client:")
+    print(f"{indent}  · gameoverlayrenderer.so mapped (see build block above)")
+    found = discover_shm_path(r.pid)
+    if found:
+        _, size, _ = found
+        print(f"{indent}  · InputEvent ring mapped ({size} bytes)")
+    if path_for_pid(r.pid).is_file():
+        print(f"{indent}  · canonical GameOverlay_InputEventStream_{r.pid} shared memory")
+    elif _vulkan_layer_map_paths(r.pid):
+        print(f"{indent}  · Proton/Wine renames the ring to u1000-Shm_* (fd path shown below)")
+    elif found and "GameOverlay_InputEventStream" in found[2]:
+        print(f"{indent}  · GameOverlay_InputEventStream name in /proc/maps")
 
 
 def _print_scan_launch_summary(rows: list[ScanRow]) -> None:
@@ -653,6 +768,7 @@ def print_scan_deduped(
     live: bool,
     shm_sample_sec: float,
     no_shm: bool,
+    shm_clients: bool = True,
 ) -> bool:
     rows = _gather_scan_rows(pids)
     if not rows:
@@ -662,10 +778,15 @@ def print_scan_deduped(
         by_sha[row.info.sha256].append(row)
 
     n_proc = len({r.pid for r in rows})
-    print(f"=== {len(by_sha)} overlay build(s) · {n_proc} InputEvent SHM client(s) ===\n")
-    game_renderer = _game_renderer_rows(rows)
-    game_shas = {r.info.sha256 for r in game_renderer}
-    _print_game_renderer_guess(game_renderer, rows, brief=brief)
+    if shm_clients:
+        print(f"=== {len(by_sha)} overlay build(s) · {n_proc} InputEvent SHM client(s) ===\n")
+    else:
+        print(
+            f"=== {len(by_sha)} overlay build(s) · {n_proc} process(es) "
+            f"mapping gameoverlayrenderer.so ===\n"
+        )
+        print("  No InputEvent SHM client matched; listing all renderer mappings.\n")
+    game_shas = {r.info.sha256 for r in _game_renderer_rows(rows)}
     for idx, sha in enumerate(sorted(by_sha.keys()), 1):
         group = sorted(by_sha[sha], key=lambda r: (r.info.deploy_path or "", r.pid))
         sample = group[0]
@@ -694,6 +815,7 @@ def print_scan_deduped(
                 print(f"      cmd: {_cmd_short(r.cmd)}")
             if r.pid not in layer_done:
                 layer_done.add(r.pid)
+                _print_renderer_detection(r, indent="      ", brief=brief)
                 _print_layer_vulkan_status(r.pid, indent="      ", brief=brief)
                 if not no_shm:
                     print_inputevent_shm(
@@ -882,7 +1004,7 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument(
         "--scan",
         action="store_true",
-        help="Processes with gameoverlayrenderer.so and qualified InputEvent SHM only",
+        help="Prefer InputEvent SHM clients; else list gameoverlayrenderer.so mappings",
     )
     ap.add_argument(
         "--games-only",
@@ -904,9 +1026,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--shm-sample-sec",
         type=float,
-        default=1.0,
+        default=2.0,
         metavar="SEC",
-        help="Seconds between InputEvent SHM cursor reads (default 1)",
+        help="Seconds to watch InputEvent write cursor for frame-loop heuristic (default 2)",
     )
     ap.add_argument(
         "--no-shm",
@@ -916,11 +1038,10 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     if args.scan:
-        pids = pids_for_scan()
+        pids, shm_clients = pids_for_scan()
         if not pids:
             print(
-                "No InputEvent SHM overlay client found "
-                "(need gameoverlayrenderer.so mapped and the 524304-byte event ring).",
+                "No process maps gameoverlayrenderer.so.",
                 file=sys.stderr,
             )
             return 1
@@ -930,6 +1051,7 @@ def main(argv: list[str] | None = None) -> int:
             live=not args.no_live,
             shm_sample_sec=args.shm_sample_sec,
             no_shm=args.no_shm,
+            shm_clients=shm_clients,
         )
         return 0 if ok else 1
 

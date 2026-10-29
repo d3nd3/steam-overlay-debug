@@ -15,4 +15,4 @@ overlay-scan = "scan:main"
 overlay-version = "version:main"
 
 [tool.setuptools]
-py-modules = ["scan", "version", "online_lookup", "inputevent_shm", "__init__"]
+py-modules = ["scan", "version", "online_lookup", "inputevent_shm", "vulkan_layer_manifest", "__init__"]
