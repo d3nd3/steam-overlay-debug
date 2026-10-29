@@ -20,6 +20,20 @@ GAME_COMMS = frozenset({"dota2", "cs2", "GameThread", "hl2_linux", "dota.sh"})
 SKIP_COMMS = frozenset(
     {"python3", "python", "sleep", "cat", "grep", "bash", "sh", "reaper", "steam-launch-wrapper"}
 )
+WINE_OVERLAY_HELPER = frozenset(
+    {
+        "steam.exe",
+        "wineserver",
+        "services.exe",
+        "winedevice.exe",
+        "svchost.exe",
+        "plugplay.exe",
+        "lsass.exe",
+        "rpcss.exe",
+        "tabtip.exe",
+        "python3",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -109,21 +123,26 @@ def _print_layer_vulkan_status(pid: int, *, indent: str, brief: bool) -> None:
         print(f"{indent}layer env: (no ENABLE/DISABLE_VK_LAYER, SteamNoOverlayUI, or VK_IMPLICIT_LAYER_PATH)")
 
 
-from inputevent_shm import print_for_pid as print_inputevent_shm
+from inputevent_shm import (
+    has_overlay_inputevent_client,
+    print_for_pid as print_inputevent_shm,
+)
 
 
 def _proc_comm(pid: int) -> str:
     return Path(f"/proc/{pid}/comm").read_text().strip()
 
 
-def _process_role(comm: str, cmdline: str) -> str:
+def _process_role(comm: str, cmdline: str, *, pid: int | None = None) -> str:
+    if comm in LAUNCHER_COMMS or "steam-launch-wrapper" in cmdline or " reaper " in cmdline:
+        return "launcher"
+    if pid is not None and has_overlay_inputevent_client(pid):
+        return "game"
     if comm in GAME_COMMS or re.search(
         r"steamapps/common/|AppId=\d+|\.steam/.*?/game/", cmdline
     ):
         if comm not in LAUNCHER_COMMS:
             return "game"
-    if comm in LAUNCHER_COMMS or "steam-launch-wrapper" in cmdline or " reaper " in cmdline:
-        return "launcher"
     return "other"
 
 
@@ -169,7 +188,7 @@ def _candidate_game_pids(hints: list[str], *, exclude: set[int]) -> list[int]:
             cmd = _proc_cmdline(pid)
         except (OSError, PermissionError):
             continue
-        if _process_role(comm, cmd) == "launcher" or comm in SKIP_COMMS:
+        if _process_role(comm, cmd, pid=pid) == "launcher" or comm in SKIP_COMMS:
             continue
         if comm in GAME_COMMS:
             if app_hint and app_hint not in cmd and "steamapps/common" not in cmd:
@@ -215,95 +234,160 @@ def _snapshots_for_pid(pid: int) -> list[OverlaySnap]:
     return out
 
 
+def _short_build_id(build_id: str) -> str:
+    return build_id[:8] if len(build_id) > 8 else build_id
+
+
+def _overlay_slot_english(deploy: str | None) -> str:
+    if deploy == "ubuntu12_32":
+        return "32-bit client overlay"
+    if deploy == "ubuntu12_64":
+        return "64-bit client overlay"
+    if deploy:
+        return f"{deploy} overlay"
+    return "client overlay"
+
+
+def _group_pids_by_overlay_build(
+    pids: list[int],
+) -> dict[str, tuple[str | None, list[tuple[str, int]]]]:
+    groups: dict[str, tuple[str | None, list[tuple[str, int]]]] = {}
+    for gpid in pids:
+        gs = _snapshots_for_pid(gpid)
+        if len(gs) != 1:
+            continue
+        g = gs[0]
+        try:
+            comm = _proc_comm(gpid)
+        except OSError:
+            continue
+        if g.build_id not in groups:
+            groups[g.build_id] = (g.deploy, [])
+        groups[g.build_id][1].append((comm, gpid))
+    return groups
+
+
+def _describe_proc_group(procs: list[tuple[str, int]]) -> str:
+    procs = sorted(procs, key=lambda x: x[1])
+    if len(procs) == 1:
+        c, p = procs[0]
+        return f"{c} (pid {p})"
+    players = [p for p in procs if p[0] not in WINE_OVERLAY_HELPER]
+    helpers = [p for p in procs if p[0] in WINE_OVERLAY_HELPER]
+    if len(players) == 1 and helpers:
+        c, p = players[0]
+        n = len(helpers)
+        tail = f"{n} Proton/Wine helper process{'es' if n != 1 else ''}"
+        return f"{c} (pid {p}) and {tail}"
+    if players and not helpers:
+        if len(players) <= 2:
+            return " and ".join(f"{c} (pid {p})" for c, p in players)
+        return f"{len(players)} game-related processes"
+    if helpers and not players:
+        n = len(helpers)
+        return f"{n} Proton/Wine helper process{'es' if n != 1 else ''}"
+    return f"{len(procs)} processes"
+
+
+def _overlay_build_phrase(deploy: str | None, build_id: str) -> str:
+    return f"{_overlay_slot_english(deploy)} ({_short_build_id(build_id)}…)"
+
+
+def _launcher_overlay_summary(
+    launcher_pid: int,
+    launcher_snaps: list[OverlaySnap],
+    other_pids: list[int],
+) -> str:
+    launch = launcher_snaps[0]
+    launcher_ids = {s.build_id for s in launcher_snaps}
+    try:
+        shell = f"{_proc_comm(launcher_pid)} (pid {launcher_pid})"
+    except OSError:
+        shell = f"pid {launcher_pid}"
+    groups = _group_pids_by_overlay_build(other_pids)
+    matching: list[tuple[str, int]] = []
+    other: list[tuple[str, str | None, list[tuple[str, int]]]] = []
+    for bid, (dep, procs) in groups.items():
+        if bid in launcher_ids:
+            matching.extend(procs)
+        else:
+            other.append((bid, dep, procs))
+
+    parts = [
+        f"{shell} loaded {_overlay_build_phrase(launch.deploy, launch.build_id)}.",
+    ]
+    if matching:
+        parts.append(f"The same build is mapped in {_describe_proc_group(matching)}.")
+    elif groups:
+        parts.append("No other running process in this scan uses that build.")
+    for bid, dep, procs in other:
+        verb = "maps" if len(procs) == 1 else "map"
+        parts.append(
+            f"{_describe_proc_group(procs)} {verb} {_overlay_build_phrase(dep, bid)}."
+        )
+    return " ".join(parts)
+
+
+def _session_overlay_pids(*, exclude: set[int]) -> list[int]:
+    out: list[int] = []
+    for pid in _overlay_pids_excluding(exclude=exclude):
+        try:
+            if _proc_comm(pid) in SKIP_COMMS:
+                continue
+        except OSError:
+            continue
+        if has_overlay_inputevent_client(pid):
+            out.append(pid)
+    return sorted(out)
+
+
 def _print_launcher_game_check(
     launcher_pid: int,
     launcher_cmd: str,
     launcher_snaps: list[OverlaySnap],
 ) -> None:
     app_id, hints = _launch_hints(launcher_cmd)
-    label = ", ".join(repr(h) for h in hints) if hints else "cmdline"
-    print(f"  Game check (hints: {label}):")
     if not hints:
-        print("    Could not parse AppId/game path from launcher cmdline.")
+        print("  Could not parse AppId or game path from this launch shell.")
         return
 
     launcher_ids = {s.build_id for s in launcher_snaps}
     game_pids = _candidate_game_pids(hints, exclude={launcher_pid})
-    overlay_pids = _overlay_pids_excluding(exclude={launcher_pid})
+    other_pids = _session_overlay_pids(exclude={launcher_pid})
 
-    if not game_pids and not overlay_pids:
-        print("    No matching game process in /proc (game not running yet?).")
+    if not game_pids and not other_pids:
+        print("  No matching game process in /proc (game not running yet?).")
         return
 
-    any_overlay = False
-    all_game_snaps: list[OverlaySnap] = []
-
-    def report_pid(gpid: int, label: str) -> None:
-        nonlocal any_overlay, all_game_snaps
-        gs = _snapshots_for_pid(gpid)
-        gcomm = _proc_comm(gpid)
-        if not gs:
-            print(f"    {label} pid {gpid} ({gcomm}): no gameoverlayrenderer.so in maps")
-            return
-        any_overlay = True
-        all_game_snaps.extend(gs)
-        for g in gs:
-            same = g.build_id in launcher_ids
-            rel = "SAME build as launcher" if same else "DIFFERENT from launcher"
-            launch_paths = {s.pathname for s in launcher_snaps}
-            path_note = ""
-            if g.pathname not in launch_paths:
-                path_note = " (different path)" if not same else " (same build, different path)"
-            print(f"    {label} pid {gpid} ({gcomm}): Build ID {g.build_id}{path_note} — {rel}")
-            if launcher_snaps and g.deploy and g.deploy != launcher_snaps[0].deploy:
-                print(f"      deploy: {g.deploy} vs launcher {launcher_snaps[0].deploy}")
-
-    for gpid in game_pids:
-        report_pid(gpid, "game")
-
-    extra = [p for p in overlay_pids if p not in game_pids]
-    shown_extra: list[int] = []
-    if extra:
-        for gpid in extra:
-            try:
-                if _proc_comm(gpid) in SKIP_COMMS:
-                    continue
-            except OSError:
-                continue
-            shown_extra.append(gpid)
-        if shown_extra:
-            print("    Also mapping overlay (any role):")
-            for gpid in shown_extra:
-                report_pid(gpid, "overlay")
+    if launcher_snaps and other_pids:
+        print(f"  {_launcher_overlay_summary(launcher_pid, launcher_snaps, other_pids)}")
 
     game_snaps = [g for gpid in game_pids for g in _snapshots_for_pid(gpid)]
 
     if game_pids and not game_snaps:
         if 'LD_PRELOAD=""' in launcher_cmd or "LD_PRELOAD=''" in launcher_cmd:
             print(
-                '    Note: launcher cmdline clears LD_PRELOAD (""); overlay on this '
-                "sh/reaper shell does not imply the game inherited preload."
+                "  Note: this launch shell clears LD_PRELOAD; overlay mapped here "
+                "does not mean the game inherited the same preload."
             )
         if app_id == "570" or "dota" in launcher_cmd.lower():
             print(
-                "    Note: Dota on linuxsteamrt64 normally maps steamrt64/gameoverlayrenderer.so "
-                "in the game process when injected; ubuntu12_64 on the launcher alone matches "
-                "the missing-frame-tick case in CLARITY.md."
+                "  Note: Dota on linuxsteamrt64 normally maps the steamrt64 overlay "
+                "in the game process when injection works; ubuntu12_64 on the shell "
+                "alone matches the missing-frame-tick case in CLARITY.md."
             )
         print(
-            "    → Game PIDs are running but none map gameoverlayrenderer.so; "
-            "the launcher preload above does not apply to the game process."
+            "  Game processes are running but none map gameoverlayrenderer.so; "
+            "the preload on this shell does not apply inside the game."
         )
-        if all_game_snaps and shown_extra:
-            print(
-                "    (Other non-launcher PIDs still map overlay — see “Also mapping overlay” above.)"
-            )
+        if other_pids:
+            print("  Other processes in this session still map the overlay (see summary above).")
         return
 
     if game_snaps and all(g.build_id in launcher_ids for g in game_snaps):
-        print("    → Confirmed: game process uses the same overlay build as this launcher.")
+        print("  The game process uses the same overlay build as this launch shell.")
     elif game_snaps:
-        print("    → Game uses a different overlay build than this launcher shell.")
+        print("  The game process uses a different overlay build than this launch shell.")
 
 
 def _parse_maps_line(pid: int, line: str) -> LoadedOverlay | None:
@@ -381,12 +465,29 @@ def pids_with_overlay_loaded(*, include_launchers: bool) -> list[int]:
             if not include_launchers:
                 comm = _proc_comm(pid)
                 cmd = _proc_cmdline(pid)
-                if _process_role(comm, cmd) == "launcher":
+                if _process_role(comm, cmd, pid=pid) == "launcher":
                     continue
             hits.append(pid)
         except (OSError, PermissionError, FileNotFoundError):
             continue
     return hits
+
+
+def pids_for_scan() -> list[int]:
+    """Processes listed by --scan: map gameoverlayrenderer.so and host InputEvent SHM."""
+    hits: list[int] = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        try:
+            if not overlay_mappings(pid):
+                continue
+        except (OSError, PermissionError, FileNotFoundError):
+            continue
+        if has_overlay_inputevent_client(pid):
+            hits.append(pid)
+    return sorted(set(hits))
 
 
 def analyze_loaded(entry: LoadedOverlay) -> OverlayVersion:
@@ -454,7 +555,7 @@ def _gather_scan_rows(pids: list[int]) -> list[ScanRow]:
             continue
         comm = _proc_comm(pid)
         cmd = _proc_cmdline(pid)
-        role = _process_role(comm, cmd)
+        role = _process_role(comm, cmd, pid=pid)
         for ent in mappings:
             try:
                 info = analyze_loaded(ent)
@@ -464,32 +565,73 @@ def _gather_scan_rows(pids: list[int]) -> list[ScanRow]:
     return rows
 
 
+def _game_renderer_rows(rows: list[ScanRow]) -> list[ScanRow]:
+    """Overlay build mapped in the live game client (InputEvent SHM), one row per pid."""
+    picked: dict[int, ScanRow] = {}
+    for r in rows:
+        if r.comm in LAUNCHER_COMMS:
+            continue
+        if not has_overlay_inputevent_client(r.pid):
+            continue
+        picked.setdefault(r.pid, r)
+    if picked:
+        return sorted(picked.values(), key=lambda x: x.pid)
+    for r in rows:
+        if r.role != "game" or r.comm in LAUNCHER_COMMS:
+            continue
+        picked.setdefault(r.pid, r)
+    return sorted(picked.values(), key=lambda x: x.pid)
+
+
+def _print_game_renderer_guess(
+    clients: list[ScanRow], rows: list[ScanRow], *, brief: bool
+) -> None:
+    print("=== Game renderer (guess) ===")
+    if not clients:
+        print("  No InputEvent SHM client with overlay mapped — cannot infer active build.\n")
+        return
+    for r in clients:
+        phrase = _overlay_build_phrase(r.info.deploy_path, r.info.gnu_build_id or r.info.sha256)
+        if brief:
+            print(f"  {r.comm} pid {r.pid}: {phrase}")
+        else:
+            print(f"  {r.comm} (pid {r.pid}): {phrase}")
+            print(f"    {r.ent.pathname}")
+    if len({r.info.sha256 for r in rows}) > len({r.info.sha256 for r in clients}):
+        print("  (Other builds in this scan are launch-shell preloads or unrelated mappings.)")
+    print()
+
+
 def _print_scan_launch_summary(rows: list[ScanRow]) -> None:
     games = [r for r in rows if r.role == "game"]
     launchers = [r for r in rows if r.role == "launcher"]
     if not games and not launchers:
         return
-    print("=== Launch vs game ===")
+    print("=== Overlay summary ===")
     if games:
         by_sha: dict[str, list[ScanRow]] = defaultdict(list)
         for g in games:
             by_sha[g.info.sha256].append(g)
         for sha, grp in by_sha.items():
             r0 = grp[0]
-            names = ", ".join(f"{r.comm}/{r.pid}" for r in sorted(grp, key=lambda x: x.pid))
+            names = ", ".join(f"{r.comm} pid {r.pid}" for r in sorted(grp, key=lambda x: x.pid))
             print(
-                f"  Game ({names}): Build ID {r0.info.gnu_build_id} · deploy {r0.info.deploy_path}"
+                f"  Game {names}: {_overlay_build_phrase(r0.info.deploy_path, r0.info.gnu_build_id or sha)}"
             )
+    launcher_pids = {lr.pid for lr in launchers}
+    session_pids = _session_overlay_pids(exclude=launcher_pids)
     for lr in sorted(launchers, key=lambda x: x.pid):
         game_sha = games[0].info.sha256 if games else None
         if game_sha and lr.info.sha256 == game_sha:
-            print(f"  Launcher {lr.comm}/{lr.pid}: same overlay build as game")
+            print(f"  {lr.comm} (pid {lr.pid}): same overlay build as the game process")
         elif games:
+            g0 = games[0]
             print(
-                f"  Launcher {lr.comm}/{lr.pid}: Build ID {lr.info.gnu_build_id} · "
-                f"{lr.info.deploy_path} — differs from game (often unused 32-bit preload on reaper)"
+                f"  {lr.comm} (pid {lr.pid}): {_overlay_build_phrase(lr.info.deploy_path, lr.info.gnu_build_id or lr.info.sha256)} "
+                f"— the game uses {_overlay_build_phrase(g0.info.deploy_path, g0.info.gnu_build_id or g0.info.sha256)} "
+                "(often an unused 32-bit preload on the reaper step)"
             )
-        else:
+        elif session_pids:
             snaps = [
                 OverlaySnap(
                     pid=lr.pid,
@@ -500,7 +642,7 @@ def _print_scan_launch_summary(rows: list[ScanRow]) -> None:
                     deploy=lr.info.deploy_path,
                 )
             ]
-            _print_launcher_game_check(lr.pid, lr.cmd, snaps)
+            print(f"  {_launcher_overlay_summary(lr.pid, snaps, session_pids)}")
     print()
 
 
@@ -520,15 +662,16 @@ def print_scan_deduped(
         by_sha[row.info.sha256].append(row)
 
     n_proc = len({r.pid for r in rows})
-    print(
-        f"=== {len(by_sha)} distinct overlay build(s) · "
-        f"{n_proc} process(es) mapping gameoverlayrenderer.so ===\n"
-    )
+    print(f"=== {len(by_sha)} overlay build(s) · {n_proc} InputEvent SHM client(s) ===\n")
+    game_renderer = _game_renderer_rows(rows)
+    game_shas = {r.info.sha256 for r in game_renderer}
+    _print_game_renderer_guess(game_renderer, rows, brief=brief)
     for idx, sha in enumerate(sorted(by_sha.keys()), 1):
         group = sorted(by_sha[sha], key=lambda r: (r.info.deploy_path or "", r.pid))
         sample = group[0]
         dep = sample.info.deploy_path or "?"
-        print(f"--- build {idx}/{len(by_sha)} · {dep} · Build ID {sample.info.gnu_build_id} ---")
+        in_use = " · used by game" if sha in game_shas else ""
+        print(f"--- build {idx}/{len(by_sha)} · {dep} · Build ID {sample.info.gnu_build_id}{in_use} ---")
         if brief:
             fp = sample.info.fingerprint or "—"
             print(f"  fingerprint {fp}  sha256 {sample.info.sha256[:16]}…")
@@ -558,8 +701,6 @@ def print_scan_deduped(
                     )
         print()
 
-    if not brief:
-        _print_scan_launch_summary(rows)
     return True
 
 
@@ -665,7 +806,7 @@ def print_process_report(
 
     comm = _proc_comm(pid)
     cmd = _proc_cmdline(pid)
-    role = _process_role(comm, cmd)
+    role = _process_role(comm, cmd, pid=pid)
 
     if not mappings:
         print(f"pid {pid} ({comm}): no gameoverlayrenderer.so mapped")
@@ -717,7 +858,10 @@ def print_process_report(
 
 def print_scan_preamble(*, games_only: bool) -> None:
     if games_only:
-        print("Showing game-role PIDs only (launcher preloads hidden).\n")
+        print(
+            "Listing processes with InputEvent SHM (game client); "
+            "launcher preloads hidden.\n"
+        )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -738,12 +882,12 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument(
         "--scan",
         action="store_true",
-        help="All processes that currently map gameoverlayrenderer.so",
+        help="Processes with gameoverlayrenderer.so and qualified InputEvent SHM only",
     )
     ap.add_argument(
         "--games-only",
         action="store_true",
-        help="With --scan, hide launcher shells (sh/reaper); default lists every PID",
+        help=argparse.SUPPRESS,
     )
     ap.add_argument("--include-launchers", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument(
@@ -772,11 +916,13 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     if args.scan:
-        games_only = args.games_only and not args.include_launchers
-        print_scan_preamble(games_only=games_only)
-        pids = pids_with_overlay_loaded(include_launchers=not games_only)
+        pids = pids_for_scan()
         if not pids:
-            print("No process maps gameoverlayrenderer.so.", file=sys.stderr)
+            print(
+                "No InputEvent SHM overlay client found "
+                "(need gameoverlayrenderer.so mapped and the 524304-byte event ring).",
+                file=sys.stderr,
+            )
             return 1
         ok = print_scan_deduped(
             pids,
