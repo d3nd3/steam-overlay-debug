@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "steam-overlay-debug"
+version = "0.1.0"
+description = "Scan Linux game processes for Steam overlay builds, Vulkan layer policy, and InputEvent SHM (#11446)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+[project.scripts]
+overlay-scan = "scan:main"
+overlay-version = "version:main"
+
+[tool.setuptools]
+py-modules = ["scan", "version", "online_lookup", "inputevent_shm", "__init__"]
