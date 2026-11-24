@@ -2,6 +2,8 @@
 
 Linux tooling for [ValveSoftware/steam-for-linux#11446](https://github.com/ValveSoftware/steam-for-linux/issues/11446) — overlay **`gameoverlayrenderer.so`** loaded but InputEvent shared memory fills when the per-frame clear path does not run.
 
+Prefer pictures? Start with **[HUMANS.md](HUMANS.md)**.
+
 ## Install
 
 ```bash

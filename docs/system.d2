@@ -1,0 +1,108 @@
+# steam-overlay-debug — system overview
+# A read-only inspector: it walks /proc, maps /dev/shm, and identifies overlay builds.
+# Nothing in this repo writes to Steam or to a game; only --write-version-md writes files.
+# Zones run left to right: entry points -> core -> state -> external.
+# Style classes set strokes only, so light and dark stay readable.
+
+title: |md
+  # steam-overlay-debug
+  Explains why the Steam overlay is loaded but its InputEvent ring stops draining (#11446), by reading `/proc`, `/dev/shm` and the overlay binary.
+| {near: top-center}
+
+direction: right
+grid-columns: 2
+grid-rows: 2
+horizontal-gap: 200
+vertical-gap: 180
+
+entry: Entry points {
+  direction: down
+
+  scan: `overlay-scan` · `--pid` / `--comm` / `--cmdline` / `--scan`, `-q`, `--no-live`, `--shm-sample-sec`
+  version: `overlay-version` · one binary, a folder or `-r` · `--sort`, `--write-version-md`, `--online-lookup`
+  install: `pipx install .` · two console scripts over five plain modules, no package directory
+
+  scan -> version: same analyzer, different question
+}
+
+state: State {
+  direction: down
+
+  snapshot: a scan is a point-in-time snapshot · no history, no daemon, no pid file
+  rows: rows in memory · grouped by sha256, one block per distinct overlay build
+  globals: `online_lookup` module globals · the manifest is fetched once per run {shape: cylinder}
+  versionmd: `VERSION.md` + `version_label/` folders · the only thing ever written {shape: cylinder}
+}
+
+core: Core {
+  direction: right
+  grid-columns: 3
+  grid-rows: 1
+  horizontal-gap: 110
+
+  observe: observe the process {
+    direction: down
+
+    procwalk: `/proc` walk · `pids_for_scan`: SHM clients first, then any mapping
+    maps: `maps` parse · `map_files/<vma>` for deleted .so, dedupe by inode
+    role: `_process_role` · launcher / game / other · game means it owns an InputEvent ring
+    analyzer: `version.py` · PE/ELF, Build ID, FileVersion, toolchain, slot
+
+    procwalk -> maps: only processes that map an overlay
+    maps -> role: the mapping alone does not say who runs the game
+    maps -> analyzer: read the bytes the process actually has mapped
+  }
+
+  measure: measure the ring and the layer {
+    direction: down
+
+    shmfind: `discover_shm_path` · name, else a 524304/524288 map, fd by size
+    validate: header `kind == 2` at +16 and cursor ≤ capacity · otherwise keep looking
+    probe: `probe_pid` · uint32 at +4 twice, ring % full
+    layer: `vulkan_layer_manifest` · ENABLE/DISABLE env, `VK_*_PATH`
+    graphics: `_overlay_graphics_report` · Vulkan layer vs preload vs Wine
+
+    shmfind -> validate: a same-size map is not proof
+    validate -> probe: only a plausible ring gets sampled
+    probe -> layer: frame heartbeat next to layer policy
+  }
+
+  explain: explain it {
+    direction: down
+
+    group: `print_scan_deduped` · one block per sha256, then every pid
+    launcher: `_print_launcher_game_check` · shell build vs game build
+    online: `online_lookup` · CRC32 vs SteamTracking, debuginfod by id
+    report: `-q` · build id, injector, APIs, frame-loop yes/no
+
+    group -> launcher: the launcher is the usual red herring
+    group -> online: the CRC is the only cheap identity across machines
+    online -> report: online detail is optional, the verdict is local
+  }
+}
+
+ext: External {
+  direction: down
+
+  proc: `/proc/<pid>/maps`, `environ`, `comm`, `cmdline`, `fd` · the whole evidence base
+  shm: `/dev/shm/GameOverlay_InputEventStream_<pid>` · 524288 B ring + 16 B header
+  steamtree: installed Steam tree · `ubuntu12_*`, `steamrt64`, `pressure-vessel-libs` deploy slots
+  tracking: `SteamDatabase/SteamTracking` · `ClientContentLinux.txt` CRC list + client manifest
+  debuginfod: `debuginfod.steamos.cloud` · build id → debuginfo, 404 for client overlays
+}
+
+entry -> core: a command picks a report
+ext -> core: everything is read, never written
+core -> state: one row per build, one snapshot per run
+
+classes: {
+  entry: {style: {stroke: "#2f6fbf"}}
+  core: {style: {stroke: "#2f8f5f"}}
+  state: {style: {stroke: "#a86a12"; stroke-dash: 3}}
+  ext: {style: {stroke: "#8a4fbf"; stroke-dash: 5}}
+}
+
+entry.class: entry
+core.class: core
+state.class: state
+ext.class: ext
